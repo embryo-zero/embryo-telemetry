@@ -1,0 +1,534 @@
+# Configuration merging
+
+## Background
+
+As part of issue [#8754](https://github.com/open-telemetry/opentelemetry-collector/issues/8754), a new feature gate has been introduced to support merging component lists instead of replacing them ([first PR](https://github.com/open-telemetry/opentelemetry-collector/pull/12097)). This enhancement enables configurations from multiple sources to be combined, preserving all defined components in the final configuration.
+
+More information about this feature can be found in the [confmap README](https://github.com/open-telemetry/opentelemetry-collector/blob/d4539dd6b4e554e15066226fa975b156af7b1510/confmap/README.md#experimental-append-merging-strategy-for-lists).
+
+The main motivation for this change was to allow users to define configuration fragments in different sources, and have them merged in such a way that all specified components are included under `service::pipeline` in the final configuration.
+
+Previously, we relied on Koanf’s default merging strategy, which overrides static values and slices (such as strings, numbers, and lists). This behavior often resulted in configurations being unintentionally overwritten when merged from multiple sources.
+
+This issue has been highlighted in several discussions and feature requests:
+- https://github.com/open-telemetry/opentelemetry-collector/issues/8394
+- https://github.com/open-telemetry/opentelemetry-collector/issues/8754
+- https://github.com/open-telemetry/opentelemetry-collector/issues/10370
+
+## Motivation and Scope
+
+We’ve already implemented a feature gate and foundational logic that supports merging lists across configuration files. Currently, this logic is hardcoded to merge lists only for specific keys: receivers, exporters, and extensions. The relevant implementation can be found [here](https://github.com/open-telemetry/opentelemetry-collector/blob/main/confmap/internal/merge.go).
+
+The current implementation lacks flexibility. Ideally, users should be able to specify which configuration paths should be merged, rather than relying on hardcoded defaults.
+This RFC proposes extending the existing functionality by introducing a user-configurable mechanism to define merge behavior.
+
+This RFC builds on top of feedback gathered from the [original PR](https://github.com/open-telemetry/opentelemetry-collector/pull/12097).
+More specifically, this RFC aims to:
+1. Add an option to specify which configuration paths should be merged.
+2. Introduce support for prepend and append operations when merging list values:
+    - This is good to have for lists that rely on certain ordering, such as:
+        - `processors`
+        - `transformprocessor` statements
+
+## Proposed approaches:
+
+### Approach 1 (Recommended): Use yaml tags
+
+The first approach relies on the concept of [yaml tags](https://yaml.org/spec/1.2.2/#24-tags). We can specify a custom tag in our configuration files to indicate the lists we want to merge.
+
+Consider following two configurations:
+
+```yaml
+#main.yaml
+receivers:
+    ...
+exporters:
+    ...
+extensions:
+    extension1:
+
+service:
+  extensions: [extension1]
+  pipelines:
+    logs:
+      receivers: [...]
+      exporters: [...]
+```
+
+```yaml
+#extra.yaml
+extensions:
+    extension2:
+
+service:
+  extensions: !mode=append [extension2]
+```
+
+After running the collector with above configurations, the `service::extensions` path will get merged and final configuration will look like:
+
+```yaml
+#final.yaml
+receivers:
+    ...
+exporters:
+    ...
+extensions:
+    extension1:
+    extension2:
+
+service:
+  extensions: [extension1, extension2]
+  pipelines:
+    logs:
+      receivers: [...]
+      exporters: [...]
+```
+
+This approach completely relies on the configuration files and doesn't introduce any command line option.
+Internally, we will loop through the yaml tree and fetch the paths we want to merged based on user-defined tags, then merge the lists found at those paths.
+
+Our "custom" yaml tag will be in the format of URI query parameters. For starters, we can support following options:
+1. `mode`:
+    - This setting will control the ordering of merged list.
+    - The value will be either of `append` or `prepend`.
+    - Default: `append`
+2. `duplicates`:
+    - This setting controls the duplication of elements in the final list.
+    - If the user wants to allow duplicates, they can simply turn this flag on.
+    - Default: `false`
+3. `recursive`:
+    - This setting controls the merging of child elements of the given yaml path.
+    - This is useful if user wants to merge all the lists under a give sub-tree.
+        - For eg. merging all the lists under the `service` section.
+
+#### Examples of first approach
+
+1. _Merge the `service::extensions` list_:
+
+```yaml
+#main.yaml
+receivers:
+    ...
+exporters:
+    ...
+extensions:
+    extension1:
+
+service:
+  extensions: [extension1]
+  pipelines:
+    logs:
+      receivers: [...]
+      exporters: [...]
+      
+---
+
+#extra.yaml
+extensions:
+    extension2:
+
+service:
+  extensions: !mode=append [extension2]
+```
+
+```yaml
+#final.yaml
+receivers:
+    ...
+exporters:
+    ...
+extensions:
+    extension1:
+    extension2:
+
+service:
+  extensions: [extension1, extension2]
+  pipelines:
+    logs:
+      receivers: [...]
+      exporters: [...]
+```
+
+2. _Merge all the lists under the `service::*` section_:
+
+```yaml
+#main.yaml
+receivers:
+    ...
+exporters:
+    ...
+extensions:
+    extension1:
+
+service:
+  extensions: [extension1]
+  pipelines:
+    logs:
+      receivers: [...]
+      exporters: [...]
+      
+---
+
+#extra.yaml
+extensions:
+    extension2:
+receiver:
+    receiver2:
+
+service: !mode=append&recursive=true
+  extensions: [extension2]
+  pipelines:
+    logs:
+        receivers: [receiver2]
+```
+
+```yaml
+#final.yaml
+receivers:
+    ...
+    receiver2:
+exporters:
+    ...
+extensions:
+    extension1:
+    extension2:
+
+service:
+  extensions: [extension1, extension2]
+  pipelines:
+    logs:
+      receivers: [..., receiver2]
+      exporters: [...]
+```
+
+### Approach 2: URI params
+
+The proposed approach will rely on concept of URI query parameters([_RFC 3986_](https://datatracker.ietf.org/doc/html/rfc3986#page-23)). Our configuration URIs already adhere to this syntax and we can extend it to support query params instead adding new CLI flags.
+
+For now, the new merging strategy is only enabled under `confmap.enableMergeAppendOption` gate. If user specifies the options and tries to run the collector without gate, we will merge as per default behaviour.
+
+We will support new parameters to config URIs as follows:
+1. `merge_paths`: A comma-separated list of glob patterns which will be used while config merging
+    - This setting will control the paths user wants to merge from the given config.
+    - Example:
+        - `otelcol --config main.yaml --config extra.yaml?merge_paths=service::extensions,service::**::receivers`
+            - In this example, we will merge the list of extensions and receivers from pipeline, excluding lists in the rest of the config.
+        - `otelcol --config main.yaml --config ext.yaml?merge_paths=service::extensions --config rec.yaml?merge_paths=service::**::receivers`
+            - In this example, we will merge all list of extensions from `ext.yml` and list of receivers from `rec.yaml`, excluding lists in the rest of the config.
+2. `merge_mode`: One of `prepend` or `append`.
+    - This setting will control the ordering of merged list.
+
+#### Examples of second approach
+
+Here are some examples:
+
+1. _Append to default mergeable components_:
+```bash
+otelcol --config=main.yaml --config=extra_components.yaml?merge_mode=append --feature-gates=confmap.enableMergeAppendOption
+```
+
+- After running above command, the final configuration will include:
+    - Merged component(s) (`receivers`, `exporters` and `extensions`) from `extra_components.yaml`
+
+2. _Specify exact paths for merging_:
+```bash
+otelcol \
+  --config=main.yaml \
+  --config=extra_extension.yaml?merge_mode=append&merge_paths=service::extensions \
+  --config=extra_receiver.yaml?merge_mode=append&merge_paths=service::**::receivers \
+  --feature-gates=confmap.enableMergeAppendOption
+```
+
+- After running above command, the final configuration will include:
+    - Merged extension(s) from `extra_extension.yaml`
+    - Merged receiver(s) from `extra_receiver.yaml`
+
+3. _Prepend processors_:
+```bash
+otelcol --config=main.yaml --config=extra_processor.yaml?merge_mode=prepend&merge_paths=service::**::processors --feature-gates=confmap.enableMergeAppendOption
+```
+
+- After running above command, the final configuration will include:
+    - Merged processor(s) from `extra_processor.yaml`, but prepend the existing list.
+
+4. _Exclude a config file from lists merging process_:
+```bash
+otelcol --config=main.yaml --config=extra_components.yaml?merge_mode=append --config override_components.yaml --feature-gates=confmap.enableMergeAppendOption
+```
+
+- In the above command, we have no specified any options for `override_components.yaml`. Hence, it will override all the conflicting lists from previous configuration, which is the default behaviour.
+
+### Approach 3: CLI flags (`--merge-list`)
+
+This approach adds separate top-level CLI flags to control the merging behaviour, instead of adding it to config file URIs.
+
+#### Design
+
+Two new flags are added to the collector:
+
+| Flag | Description |
+|---|---|
+| `--merge-list=<path>` | Mark a config path (glob pattern) as a merge target. Repeatable. |
+| `--merge-mode=<append\|prepend>` | Merge mode. Default: `append`. |
+
+`<path>` follows the same `::` separator convention already used in confmap (e.g. `service::extensions`, `service::pipelines::*::processors`).
+
+#### Examples
+
+1. _Merge all lists under `service`_:
+
+```bash
+otelcol \
+  --config=main.yaml \
+  --config=extra.yaml \
+  --merge-list="service::*" \
+  --feature-gates=confmap.enableMergeAppendOption
+```
+
+2. _Merge extensions (append) and processors (prepend) independently_:
+
+```bash
+otelcol \
+  --config=main.yaml \
+  --config=extra_extensions.yaml \
+  --config=extra_processors.yaml \
+  --merge-list="service::extensions:append" \
+  --merge-list="service::pipelines::*::processors:prepend" \
+  --feature-gates=confmap.enableMergeAppendOption
+```
+
+3. _Merge a deeply nested transform processor statement list_:
+
+```bash
+otelcol \
+  --config=main.yaml \
+  --config=extra_transforms.yaml \
+  --merge-list="processors::transform::statements" \
+  --feature-gates=confmap.enableMergeAppendOption
+```
+
+---
+
+### Approach 4: `merge_strategy:` block inside a config file
+
+Instead of annotating individual yaml nodes (Approach 1) or touching the command line (Approaches 2 & 3), a config file can carry a dedicated top-level `merge_strategy:` section that declares which paths in *that file* should be merged into the running configuration. The `merge_strategy:` section will be removed before the config is applied.
+
+The `merge_strategy:` block is local to the configuration file that contains it and it will reside under `metadata` section for a config file. It controls how that file is merged into the base configuration and is discarded immediately afterward. Because each file's `merge_strategy:` is handled independently during processing, there's no need to merge `merge_strategy:` sections across files.
+
+This keeps URIs opaque, keeps the command line short, and keeps merge intent with the data it governs.
+
+#### Schema
+
+The `mode` field controls how the incoming list is combined with the list already present in the base configuration. Supported values:
+
+| Mode | Description |
+|---|---|
+| `override` | Incoming list overwrites the base list entirely. |
+| `append` | Incoming items are added after the base items (duplicates allowed). |
+| `prepend` | Incoming items are added before the base items (duplicates allowed). |
+| `append_unique` | Only items not already present in the base list are appended after it. |
+| `prepend_unique` | Only items not already present in the base list are prepended before it. |
+| `keep` | The base list is left unchanged i.e. incoming items are ignored. |
+| `fail` | The collector fails to start if the incoming config contains a list at this path that conflicts with the base. |
+
+Default: `override`
+
+```yaml
+merge_strategy:
+  lists:
+    mode: override          # default mode applied to all list paths not listed in fields
+    fields:
+      # Inherits top-level mode unless overridden
+      - path: "service::extensions"
+        mode: append_unique
+
+      # per-path mode override
+      - path: "service::pipelines::*::processors"
+        mode: prepend_unique
+
+      # Long form with key-field merging (future):
+      # Merges list items by matching on the given key field.
+      # Items whose key matches an existing entry are updated in place;
+      # items with a new key are appended (or prepended).
+      # - path: "service::telemetry::resource::attributes"
+      #   mode: append
+      #   key: name
+```
+
+#### Examples
+
+1. _Append extensions from a supplementary file_:
+
+```yaml
+# main.yaml
+extensions:
+  health_check:
+
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [debug]
+```
+
+```yaml
+# extra_extension.yaml
+extensions:
+  file_storage:
+
+service:
+  extensions: [file_storage]
+
+metadata:
+  merge_strategy:
+    lists:
+      mode: append
+      fields:
+        - path: "service::extensions"
+```
+
+```yaml
+# final (effective) configuration
+extensions:
+  health_check:
+  file_storage:
+
+service:
+  extensions: [health_check, file_storage]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      exporters: [debug]
+```
+
+```bash
+# No special flags needed — merge intent lives in the file
+otelcol --config=main.yaml --config=extra_extension.yaml \
+  --feature-gates=confmap.enableMergeAppendOption
+```
+
+2. _Merge all pipeline lists (extensions + per-pipeline receivers/processors/exporters)_:
+
+```yaml
+# sidecar_fragment.yaml
+extensions:
+  memory_limiter:
+receivers:
+  prometheus/sidecar:
+
+service:
+  extensions: [memory_limiter]
+  pipelines:
+    metrics:
+      receivers: [prometheus/sidecar]
+
+metadata:
+  merge_strategy:
+    lists:
+      mode: append
+      fields:
+        - path: "service::extensions"
+        - path: "service::pipelines::*::receivers"
+        - path: "service::pipelines::*::processors"
+        - path: "service::pipelines::*::exporters"
+```
+
+3. _Mix append and prepend in a single fragment_:
+
+```yaml
+# fragment.yaml
+processors:
+  transform/enrich:
+  memory_limiter:
+
+service:
+  pipelines:
+    traces:
+      processors: [memory_limiter]   # prepend: run first
+    logs:
+      processors: [transform/enrich] # append: run last
+
+metadata:
+  merge_strategy:
+    lists:
+      fields:
+        - path: "service::pipelines::traces::processors"
+          mode: prepend
+        - path: "service::pipelines::logs::processors"
+          mode: append
+```
+
+4. _(Future) Merge a list of objects by key field_:
+
+The `key` field is reserved in the schema for a future strategy where list items are matched by a named field rather than by position. Items whose key already exists in the base config are updated in place; items with a new key are inserted according to `mode`. This is not part of the initial implementation but the schema is designed to accommodate it without breaking changes.
+
+```yaml
+# base.yaml
+service:
+  telemetry:
+    resource:
+      attributes:
+        - name: key1
+          value: val1
+        - name: key2
+          value: val2
+```
+
+```yaml
+# override.yaml
+service:
+  telemetry:
+    resource:
+      attributes:
+        - name: key1
+          value: new-val1   # updates existing key1 in place
+        - name: key3
+          value: val3       # new key, appended
+
+metadata:
+  merge_strategy:
+    lists:
+      fields:
+        - path: "service::telemetry::resource::attributes"
+          mode: append
+          key: name             # match items by the "name" field
+```
+
+```yaml
+# final (effective) configuration
+service:
+  telemetry:
+    resource:
+      attributes:
+        - name: key1
+          value: new-val1
+        - name: key2
+          value: val2
+        - name: key3
+          value: val3
+```
+
+---
+
+## Open questions
+
+- What to do if an invalid `mode` value is provided in `merge_strategy:` fields?
+    - Two possibilities:
+        1. Error out (recommended).
+        2. Log an error and fall back to the default mode.
+- **Approach 2**: What to do if an invalid query param is provided in a config URI?
+    - Strongly prefer erroring out.
+- **Approach 3**: Should `--merge-list` apply to *all* loaded config files?
+- **Approach 4**: Should `merge_strategy:` be allowed in the very first config file (where it would be a no-op), or should that produce a warning?
+- **Approach 4**: What is the reserved block name? Current proposal: `merge_strategy`. Alternatives: `_merge`, `x-merge`, `confmap_merge`.
+
+## Extensibility
+
+The URI-based approach (Approach 2) and the `merge_strategy:` block approach (Approach 4) are both highly extensible. In the future they can enable advanced operations such as map overriding. Currently those operations are impossible.
+
+### Key-field (indexed) merging
+
+A future requirement is merging lists of objects by a named key field. For example, merging `service::telemetry::resource::attributes` where each item has a `name` field. In this strategy, items with a matching key are updated in place and items with a new key are inserted according to `mode`. Simple positional append/prepend is insufficient for this use case.
+
+The Approach 4 schema reserves a `key` field in each long-form `lists.fields` entry specifically for this. Adding support for key-field merging in a future version will require only an implementation change — the schema already accommodates it, so there will be no breaking interface change.

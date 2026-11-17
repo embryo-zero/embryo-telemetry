@@ -1,0 +1,177 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package internal // import "go.opentelemetry.io/collector/exporter/exporterhelper/internal"
+
+import (
+	"context"
+	"errors"
+
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/consumer/consumererror"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/experr"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/queuebatch"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/request"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/sender"
+	queuebatchtelemetry "go.opentelemetry.io/collector/internal/telemetry/queuebatch"
+	"go.opentelemetry.io/collector/pipeline"
+)
+
+const (
+	// spanNameSep is duplicate between receiver and exporter.
+	spanNameSep = "/"
+
+	// ExporterKey used to identify exporters in metrics and traces.
+	ExporterKey = "exporter"
+
+	// DataTypeKey used to identify the data type in the queue size metric.
+	DataTypeKey = "data_type"
+
+	// ItemsSent used to track number of items sent by exporters.
+	ItemsSent = "items.sent"
+	// ItemsFailed used to track number of items that failed to be sent by exporters.
+	ItemsFailed = "items.failed"
+
+	// ErrorPermanentKey indicates whether the error is permanent (non-retryable).
+	ErrorPermanentKey = "error.permanent"
+)
+
+type obsReportSender[K request.Request] struct {
+	component.StartFunc
+	component.ShutdownFunc
+
+	spanName     string
+	tracer       trace.Tracer
+	spanAttrs    trace.SpanStartEventOption
+	obsMetrics   queuebatchtelemetry.ObsMetrics
+	batchEnabled bool
+	next         sender.Sender[K]
+}
+
+func newObsReportSender[K request.Request](
+	set exporter.Settings,
+	signal pipeline.Signal,
+	obsMetrics queuebatchtelemetry.ObsMetrics,
+	batchEnabled bool,
+	tracer trace.Tracer,
+	next sender.Sender[K],
+) sender.Sender[K] {
+	idStr := set.ID.String()
+	expAttr := attribute.String(ExporterKey, idStr)
+
+	return &obsReportSender[K]{
+		spanName:     ExporterKey + spanNameSep + idStr + spanNameSep + signal.String(),
+		tracer:       tracer,
+		spanAttrs:    trace.WithAttributes(expAttr, attribute.String(DataTypeKey, signal.String())),
+		obsMetrics:   obsMetrics,
+		batchEnabled: batchEnabled,
+		next:         next,
+	}
+}
+
+func (ors *obsReportSender[K]) Send(ctx context.Context, req K) error {
+	// Have to read the number of items before sending the request since the request can
+	// be modified by the downstream components like the batcher.
+	c := ors.startOp(ctx)
+	items := req.ItemsCount()
+	if ors.batchEnabled {
+		ors.obsMetrics.RecordInt(c, queuebatchtelemetry.MetricBatchSendSize, int64(items))
+		if ors.obsMetrics.ShouldRecord(c, queuebatchtelemetry.MetricBatchSendSizeBytes) {
+			ors.obsMetrics.RecordInt(c, queuebatchtelemetry.MetricBatchSendSizeBytes, int64(req.BytesSize()))
+		}
+	}
+	// Forward the data to the next consumer (this pusher is the next).
+	err := ors.next.Send(c, req)
+	ors.endOp(c, items, err)
+	return err
+}
+
+// startOp increments the in-flight request counter and creates the span
+// used to trace the operation. Returns the updated context.
+func (ors *obsReportSender[K]) startOp(ctx context.Context) context.Context {
+	ors.obsMetrics.RecordInt(ctx, queuebatchtelemetry.MetricInFlight, 1)
+
+	ctx, _ = ors.tracer.Start(ctx,
+		ors.spanName,
+		ors.spanAttrs,
+		trace.WithLinks(queuebatch.LinksFromContext(ctx)...))
+	return ctx
+}
+
+// EndOp completes the export operation that was started with StartOp.
+func (ors *obsReportSender[K]) endOp(ctx context.Context, numRecords int, err error) {
+	ors.obsMetrics.RecordInt(ctx, queuebatchtelemetry.MetricInFlight, -1)
+
+	numSent, numFailedToSend := toNumItems(numRecords, err)
+
+	ors.obsMetrics.RecordInt(ctx, queuebatchtelemetry.MetricSent, numSent)
+
+	if numFailedToSend > 0 {
+		withFailedAttrs := metric.WithAttributeSet(extractFailureAttributes(err))
+		ors.obsMetrics.RecordInt(ctx, queuebatchtelemetry.MetricSendFailure, numFailedToSend, withFailedAttrs)
+	}
+
+	span := trace.SpanFromContext(ctx)
+	defer span.End()
+	// End the span according to errors.
+	if span.IsRecording() {
+		span.SetAttributes(
+			attribute.Int64(ItemsSent, numSent),
+			attribute.Int64(ItemsFailed, numFailedToSend),
+		)
+		if err != nil {
+			span.SetStatus(otelcodes.Error, err.Error())
+		}
+	}
+}
+
+func toNumItems(numExportedItems int, err error) (int64, int64) {
+	if err != nil {
+		return 0, int64(numExportedItems)
+	}
+	return int64(numExportedItems), 0
+}
+
+func extractFailureAttributes(err error) attribute.Set {
+	if err == nil {
+		return attribute.NewSet()
+	}
+
+	attrs := []attribute.KeyValue{}
+
+	errorType := determineErrorType(err)
+	attrs = append(attrs, attribute.String(string(semconv.ErrorTypeKey), errorType))
+
+	isPermanent := consumererror.IsPermanent(err)
+	attrs = append(attrs, attribute.Bool(ErrorPermanentKey, isPermanent))
+
+	return attribute.NewSet(attrs...)
+}
+
+func determineErrorType(err error) string {
+	if experr.IsShutdownErr(err) {
+		return "Shutdown"
+	}
+
+	if errors.Is(err, context.Canceled) {
+		return "Canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "Deadline_Exceeded"
+	}
+
+	if st, ok := status.FromError(err); ok && st.Code() != codes.OK {
+		return st.Code().String()
+	}
+
+	return "_OTHER"
+}

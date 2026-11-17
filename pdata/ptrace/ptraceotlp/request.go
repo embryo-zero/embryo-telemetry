@@ -1,0 +1,135 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package ptraceotlp // import "go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
+
+import (
+	"slices"
+
+	"go.opentelemetry.io/collector/pdata/internal"
+	"go.opentelemetry.io/collector/pdata/internal/json"
+	"go.opentelemetry.io/collector/pdata/internal/otlp"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+)
+
+// ExportRequest represents the request for gRPC/HTTP client/server.
+// It's a wrapper for ptrace.Traces data.
+type ExportRequest struct {
+	orig  *internal.ExportTraceServiceRequest
+	state *internal.State
+}
+
+// NewExportRequest returns an empty ExportRequest.
+func NewExportRequest() ExportRequest {
+	return ExportRequest{
+		orig:  &internal.ExportTraceServiceRequest{},
+		state: internal.NewState(),
+	}
+}
+
+// NewExportRequestFromTraces returns a ExportRequest from ptrace.Traces.
+// Because ExportRequest is a wrapper for ptrace.Traces,
+// any changes to the provided Traces struct will be reflected in the ExportRequest and vice versa.
+func NewExportRequestFromTraces(td ptrace.Traces) ExportRequest {
+	return ExportRequest{
+		orig:  internal.GetTracesOrig(internal.TracesWrapper(td)),
+		state: internal.GetTracesState(internal.TracesWrapper(td)),
+	}
+}
+
+// MarshalProto marshals ExportRequest into proto bytes.
+func (ms ExportRequest) MarshalProto() ([]byte, error) {
+	size := ms.orig.SizeProto()
+	buf := make([]byte, size)
+	_ = ms.orig.MarshalProto(buf)
+	return buf, nil
+}
+
+// UnmarshalProto unmarshalls ExportRequest from proto bytes.
+func (ms ExportRequest) UnmarshalProto(data []byte) error {
+	err := ms.orig.UnmarshalProto(data)
+	if err != nil {
+		return err
+	}
+	otlp.MigrateTraces(ms.orig.ResourceSpans)
+	return nil
+}
+
+// MarshalJSON marshals ExportRequest into JSON bytes.
+func (ms ExportRequest) MarshalJSON() ([]byte, error) {
+	dest := json.BorrowStream(nil)
+	defer json.ReturnStream(dest)
+	ms.orig.MarshalJSON(dest)
+	if dest.Error() != nil {
+		return nil, dest.Error()
+	}
+	return slices.Clone(dest.Buffer()), nil
+}
+
+// UnmarshalJSON unmarshalls ExportRequest from JSON bytes.
+func (ms ExportRequest) UnmarshalJSON(data []byte) error {
+	iter := json.BorrowIterator(data)
+	defer json.ReturnIterator(iter)
+	ms.orig.UnmarshalJSON(iter)
+	return iter.Error()
+}
+
+// ValidateUTF8 returns false when any string in the request contains invalid UTF-8.
+func (ms ExportRequest) ValidateUTF8() bool {
+	return internal.ValidateUTF8(ms.orig)
+}
+
+// RejectInvalidUTF8 removes spans containing invalid UTF-8 and returns the number removed.
+func (ms ExportRequest) RejectInvalidUTF8() int {
+	td := ms.Traces()
+	rejected := 0
+	td.ResourceSpans().RemoveIf(func(rs ptrace.ResourceSpans) bool {
+		if !internal.ValidateUTF8(rs.Resource()) || !internal.ValidateUTF8(rs.SchemaUrl()) {
+			rejected += countResourceSpans(rs)
+			return true
+		}
+		if rs.ScopeSpans().Len() == 0 {
+			return false
+		}
+		rs.ScopeSpans().RemoveIf(func(ss ptrace.ScopeSpans) bool {
+			if !internal.ValidateUTF8(ss.Scope()) || !internal.ValidateUTF8(ss.SchemaUrl()) {
+				rejected += ss.Spans().Len()
+				return true
+			}
+			if ss.Spans().Len() == 0 {
+				return false
+			}
+			ss.Spans().RemoveIf(func(span ptrace.Span) bool {
+				invalid := !internal.ValidateUTF8(span)
+				if invalid {
+					rejected++
+				}
+				return invalid
+			})
+			return ss.Spans().Len() == 0
+		})
+		return rs.ScopeSpans().Len() == 0
+	})
+	return rejected
+}
+
+func countResourceSpans(rs ptrace.ResourceSpans) int {
+	count := 0
+	for i := 0; i < rs.ScopeSpans().Len(); i++ {
+		count += rs.ScopeSpans().At(i).Spans().Len()
+	}
+	return count
+}
+
+func (ms ExportRequest) Traces() ptrace.Traces {
+	return ptrace.Traces(internal.NewTracesWrapper(ms.orig, ms.state))
+}
+
+// SanitizeUTF8 replaces every run of invalid UTF-8 bytes in the string fields of the request with the
+// Unicode replacement character U+FFFD, so the request only contains valid UTF-8 strings afterwards.
+// Attribute keys and values, nested map and slice values, names, descriptions and other string fields
+// are all covered. Bytes values and binary identifiers (trace, span and parent span IDs) are not modified.
+func (ms ExportRequest) SanitizeUTF8() {
+	ms.state.AssertMutable()
+	internal.SanitizeUTF8ExportTraceServiceRequest(ms.orig)
+}

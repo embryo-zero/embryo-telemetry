@@ -1,0 +1,204 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package ptraceotlp
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	gootlpcollectortrace "go.opentelemetry.io/proto/slim/otlp/collector/trace/v1"
+	goproto "google.golang.org/protobuf/proto"
+
+	"go.opentelemetry.io/collector/pdata/internal"
+	"go.opentelemetry.io/collector/pdata/internal/otlp"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+)
+
+var (
+	_ json.Unmarshaler = ExportRequest{}
+	_ json.Marshaler   = ExportRequest{}
+)
+
+var tracesRequestJSON = []byte(`
+	{
+		"resourceSpans": [
+			{
+				"resource": {},
+				"scopeSpans": [
+					{
+						"scope": {},
+						"spans": [
+							{
+								"name": "test_span",
+								"status": {}
+							}
+						]
+					}
+				]
+			}
+		]
+	}`)
+
+func TestRequestToPData(t *testing.T) {
+	tr := NewExportRequest()
+	assert.Equal(t, 0, tr.Traces().SpanCount())
+	tr.Traces().ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+	assert.Equal(t, 1, tr.Traces().SpanCount())
+}
+
+func TestRequestJSON(t *testing.T) {
+	tr := NewExportRequest()
+	require.NoError(t, tr.UnmarshalJSON(tracesRequestJSON))
+	assert.Equal(t, "test_span", tr.Traces().ResourceSpans().At(0).ScopeSpans().At(0).Spans().At(0).Name())
+
+	got, err := tr.MarshalJSON()
+	require.NoError(t, err)
+	assert.Equal(t, strings.Join(strings.Fields(string(tracesRequestJSON)), ""), string(got))
+}
+
+func TestTracesProtoWireCompatibility(t *testing.T) {
+	// This test verifies that OTLP ProtoBufs generated using goproto lib in
+	// opentelemetry-proto repository OTLP ProtoBufs generated using gogoproto lib in
+	// this repository are wire compatible.
+
+	// Generate Traces as pdata struct.
+	td := NewExportRequestFromTraces(ptrace.Traces(internal.GenTestTracesWrapper()))
+
+	// Marshal its underlying ProtoBuf to wire.
+	wire1, err := td.MarshalProto()
+	require.NoError(t, err)
+	assert.NotNil(t, wire1)
+
+	// Unmarshal from the wire to OTLP Protobuf in goproto's representation.
+	var goprotoMessage gootlpcollectortrace.ExportTraceServiceRequest
+	err = goproto.Unmarshal(wire1, &goprotoMessage)
+	require.NoError(t, err)
+
+	// Marshal to the wire again.
+	wire2, err := goproto.Marshal(&goprotoMessage)
+	require.NoError(t, err)
+	assert.NotNil(t, wire2)
+
+	// Unmarshal from the wire into gogoproto's representation.
+	td2 := NewExportRequest()
+	err = td2.UnmarshalProto(wire2)
+	require.NoError(t, err)
+
+	// Now compare that the original and final ProtoBuf messages are the same.
+	// This proves that goproto and gogoproto marshaling/unmarshaling are wire compatible.
+	// Migration logic will run, so run it on the original message as well.
+	otlp.MigrateTraces(td.orig.ResourceSpans)
+	assert.Equal(t, td, td2)
+}
+
+func TestSanitizeUTF8(t *testing.T) {
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr("bad\xff", "bad\xff")
+	ss := rs.ScopeSpans().AppendEmpty()
+	ss.Scope().SetName("scope\xff")
+	span := ss.Spans().AppendEmpty()
+	span.SetName("span\xff")
+	span.Attributes().PutStr("ok", "ok")
+	span.Events().AppendEmpty().SetName("event\xff")
+	span.Links().AppendEmpty().Attributes().PutStr("link\xff", "link\xff")
+	span.Status().SetMessage("status\xff")
+
+	NewExportRequestFromTraces(td).SanitizeUTF8()
+
+	expected := ptrace.NewTraces()
+	ers := expected.ResourceSpans().AppendEmpty()
+	ers.Resource().Attributes().PutStr("bad�", "bad�")
+	ess := ers.ScopeSpans().AppendEmpty()
+	ess.Scope().SetName("scope�")
+	espan := ess.Spans().AppendEmpty()
+	espan.SetName("span�")
+	espan.Attributes().PutStr("ok", "ok")
+	espan.Events().AppendEmpty().SetName("event�")
+	espan.Links().AppendEmpty().Attributes().PutStr("link�", "link�")
+	espan.Status().SetMessage("status�")
+	assert.Equal(t, expected, td)
+}
+
+func TestSanitizeUTF8ReadOnly(t *testing.T) {
+	td := ptrace.NewTraces()
+	td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty().SetName("bad\xff")
+	td.MarkReadOnly()
+	assert.Panics(t, func() { NewExportRequestFromTraces(td).SanitizeUTF8() })
+}
+
+func TestRejectInvalidUTF8(t *testing.T) {
+	t.Run("invalid resource", func(t *testing.T) {
+		td := ptrace.NewTraces()
+		rs := td.ResourceSpans().AppendEmpty()
+		rs.Resource().Attributes().PutStr("bad", string([]byte{0xff}))
+		rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+
+		assert.False(t, NewExportRequestFromTraces(td).ValidateUTF8())
+		assert.Equal(t, 1, NewExportRequestFromTraces(td).RejectInvalidUTF8())
+		assert.Equal(t, 0, td.SpanCount())
+	})
+
+	t.Run("invalid scope", func(t *testing.T) {
+		td := ptrace.NewTraces()
+		ss := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+		ss.Scope().SetName(string([]byte{0xff}))
+		ss.Spans().AppendEmpty()
+
+		assert.Equal(t, 1, NewExportRequestFromTraces(td).RejectInvalidUTF8())
+		assert.Equal(t, 0, td.SpanCount())
+	})
+
+	t.Run("invalid resource schema url", func(t *testing.T) {
+		td := ptrace.NewTraces()
+		rs := td.ResourceSpans().AppendEmpty()
+		rs.SetSchemaUrl(string([]byte{0xff}))
+		rs.ScopeSpans().AppendEmpty().Spans().AppendEmpty()
+
+		assert.False(t, NewExportRequestFromTraces(td).ValidateUTF8())
+		assert.Equal(t, 1, NewExportRequestFromTraces(td).RejectInvalidUTF8())
+		assert.Equal(t, 0, td.SpanCount())
+	})
+
+	t.Run("invalid scope schema url", func(t *testing.T) {
+		td := ptrace.NewTraces()
+		ss := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+		ss.SetSchemaUrl(string([]byte{0xff}))
+		ss.Spans().AppendEmpty()
+
+		assert.Equal(t, 1, NewExportRequestFromTraces(td).RejectInvalidUTF8())
+		assert.Equal(t, 0, td.SpanCount())
+	})
+
+	t.Run("invalid span", func(t *testing.T) {
+		td := ptrace.NewTraces()
+		spans := td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans()
+		spans.AppendEmpty().SetName("ok")
+		spans.AppendEmpty().SetName(string([]byte{0xff}))
+
+		assert.Equal(t, 1, NewExportRequestFromTraces(td).RejectInvalidUTF8())
+		assert.Equal(t, 1, td.SpanCount())
+	})
+
+	t.Run("empty containers are kept", func(t *testing.T) {
+		td := ptrace.NewTraces()
+		td.ResourceSpans().AppendEmpty()
+		td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
+
+		assert.Equal(t, 0, NewExportRequestFromTraces(td).RejectInvalidUTF8())
+		assert.Equal(t, 2, td.ResourceSpans().Len())
+		assert.Equal(t, 1, td.ResourceSpans().At(1).ScopeSpans().Len())
+	})
+
+	t.Run("emptied containers are dropped", func(t *testing.T) {
+		td := ptrace.NewTraces()
+		td.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty().Spans().AppendEmpty().SetName(string([]byte{0xff}))
+
+		assert.Equal(t, 1, NewExportRequestFromTraces(td).RejectInvalidUTF8())
+		assert.Equal(t, 0, td.ResourceSpans().Len())
+	})
+}
